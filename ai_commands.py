@@ -466,6 +466,8 @@ async def reactions_plural(update):
     peer = update.peer
     if not isinstance(peer, PeerUser) or peer.user_id <= 0:
         return
+    peer_id = peer.user_id
+    _poll_bump(peer_id)  # реакция поднимает активность ЛС и гарантирует, что опрос запущен
     active = set()
     for rc in _reaction_counts(update):
         if getattr(rc, 'chosen_order', None) is None:
@@ -473,9 +475,9 @@ async def reactions_plural(update):
         em = getattr(getattr(rc, 'reaction', None), 'emoticon', None)
         if em:
             active.add(em)
-    new_em = _reaction_add(peer.user_id, update.msg_id, active & set(REACTION_PROMPTS))
+    new_em = _reaction_add(peer_id, update.msg_id, active & set(REACTION_PROMPTS))
     if new_em:
-        await _react_to_emojis(peer.user_id, update.msg_id, new_em)
+        await _react_to_emojis(peer_id, update.msg_id, new_em)
 
 
 @client.on(events.Raw(types=UpdateMessageReactions))  # user-side: приходит юзерботам

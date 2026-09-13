@@ -154,9 +154,11 @@ def _find_ffmpeg():
     return None
 
 
+_PY_EXE = sys.executable
 _FFMPEG_LOCAL_DIR = os.path.abspath(os.path.join(MEDIA_DIR, 'ffmpeg'))
 _FFMPEG_LOCAL_BIN = os.path.join(_FFMPEG_LOCAL_DIR, 'ffmpeg')
 _FFPROBE_LOCAL_BIN = os.path.join(_FFMPEG_LOCAL_DIR, 'ffprobe')
+
 
 def _ffmpeg_static_url():
     """URL статической сборки ffmpeg под текущую платформу (автопредустановка)."""
