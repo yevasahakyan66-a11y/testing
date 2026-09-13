@@ -8,4 +8,6 @@ qrcode>=7.4,<8.0
 Pillow>=10.0,<12.0
 deep-translator>=1.11,<2.0
 m3u8>=6.0,<7.0
+google-generativeai>=0.8,<1.0
+edge-tts>=6.1,<8.0
 # duckduckgo_search removed — Wikipedia API used instead

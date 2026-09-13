@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 _VALID_TABLES = frozenset({
     'bot_state', 'saved_data', 'notes', 'todos', 'stats',
     'reply_settings', 'sessions', 'protected_chats',
+    'ai_msgs', 'ai_facts', 'ai_auto', 'ai_lists', 'ai_flags', 'ai_quest',
 })
 
 
@@ -49,6 +50,38 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS reply_settings (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS protected_chats (chat_id TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS ai_msgs (
+                    id INTEGER PRIMARY KEY,
+                    peer_id INTEGER,
+                    sender_id INTEGER,
+                    text TEXT,
+                    date INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_msgs_peer ON ai_msgs (peer_id, date);
+                CREATE TABLE IF NOT EXISTS ai_facts (
+                    user_id INTEGER,
+                    fact TEXT,
+                    date INTEGER,
+                    PRIMARY KEY (user_id, fact)
+                );
+                CREATE TABLE IF NOT EXISTS ai_auto (
+                    user_id INTEGER PRIMARY KEY,
+                    enabled INTEGER DEFAULT 0,
+                    role TEXT DEFAULT '',
+                    prompt TEXT DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS ai_lists (
+                    user_id INTEGER PRIMARY KEY,
+                    list_type TEXT
+                );
+                CREATE TABLE IF NOT EXISTS ai_flags (
+                    user_id INTEGER PRIMARY KEY,
+                    prompt_mode INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS ai_quest (
+                    user_id INTEGER PRIMARY KEY,
+                    state TEXT
+                );
             ''')
             self.conn.commit()
 
@@ -232,3 +265,188 @@ class Storage:
 
     def clear_protected_chats(self):
         self._delete_all('protected_chats')
+
+    # ── AI: история переписки ──
+
+    def save_ai_msg(self, peer_id, sender_id, text, ts=None):
+        ts = ts or int(time.time())
+        with self.lock:
+            self.conn.execute(
+                'INSERT INTO ai_msgs (peer_id, sender_id, text, date) VALUES (?, ?, ?, ?)',
+                (peer_id, sender_id, text, ts)
+            )
+            self.conn.commit()
+
+    def get_ai_msgs(self, peer_id, limit=50, sender=None):
+        with self.lock:
+            cur = self.conn.cursor()
+            if sender is not None:
+                cur.execute(
+                    'SELECT sender_id, text, date FROM ai_msgs '
+                    'WHERE peer_id = ? AND sender_id = ? '
+                    'ORDER BY date DESC, id DESC LIMIT ?',
+                    (peer_id, sender, limit)
+                )
+            else:
+                cur.execute(
+                    'SELECT sender_id, text, date FROM ai_msgs '
+                    'WHERE peer_id = ? ORDER BY date DESC, id DESC LIMIT ?',
+                    (peer_id, limit)
+                )
+            rows = list(reversed(cur.fetchall()))
+            return [dict(r) for r in rows]
+
+    def count_ai_msgs(self, peer_id=None, sender=None):
+        with self.lock:
+            cur = self.conn.cursor()
+            if peer_id is not None and sender is not None:
+                cur.execute('SELECT COUNT(*) FROM ai_msgs WHERE peer_id = ? AND sender_id = ?',
+                            (peer_id, sender))
+                return cur.fetchone()[0]
+            if peer_id is not None:
+                cur.execute('SELECT COUNT(*) FROM ai_msgs WHERE peer_id = ?', (peer_id,))
+                return cur.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM ai_msgs')
+            return cur.fetchone()[0]
+
+    def clear_ai_msgs(self, peer_id=None):
+        with self.lock:
+            if peer_id is None:
+                self.conn.execute('DELETE FROM ai_msgs')
+            else:
+                self.conn.execute('DELETE FROM ai_msgs WHERE peer_id = ?', (peer_id,))
+            self.conn.commit()
+
+    # ── AI: факты о пользователях ──
+
+    def add_ai_fact(self, user_id, fact):
+        with self.lock:
+            self.conn.execute(
+                'INSERT OR IGNORE INTO ai_facts (user_id, fact, date) VALUES (?, ?, ?)',
+                (user_id, fact, int(time.time()))
+            )
+            self.conn.commit()
+
+    def get_ai_facts(self, user_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT fact FROM ai_facts WHERE user_id = ? ORDER BY date', (user_id,))
+            return [r[0] for r in cur.fetchall()]
+
+    def clear_ai_facts(self, user_id):
+        with self.lock:
+            self.conn.execute('DELETE FROM ai_facts WHERE user_id = ?', (user_id,))
+            self.conn.commit()
+
+    # ── AI: автоответчик на пользователя ──
+
+    def set_ai_auto(self, user_id, enabled, role='', prompt=''):
+        with self.lock:
+            self.conn.execute(
+                'INSERT INTO ai_auto (user_id, enabled, role, prompt) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled, '
+                'role = excluded.role, prompt = excluded.prompt',
+                (user_id, 1 if enabled else 0, role, prompt)
+            )
+            self.conn.commit()
+
+    def get_ai_auto(self, user_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT enabled, role, prompt FROM ai_auto WHERE user_id = ?', (user_id,))
+            row = cur.fetchone()
+        if row is None:
+            return {'enabled': False, 'role': '', 'prompt': ''}
+        return {'enabled': bool(row[0]), 'role': row[1] or '', 'prompt': row[2] or ''}
+
+    def is_ai_auto_on(self, user_id):
+        return self.get_ai_auto(user_id)['enabled']
+
+    # ── AI: blacklist / whitelist ──
+
+    def toggle_ai_list(self, user_id, list_type):
+        """true — добавлен, false — удалён."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT list_type FROM ai_lists WHERE user_id = ?', (user_id,))
+            row = cur.fetchone()
+            if row is None:
+                self.conn.execute(
+                    'INSERT INTO ai_lists (user_id, list_type) VALUES (?, ?)',
+                    (user_id, list_type)
+                )
+                self.conn.commit()
+                return True
+            self.conn.execute('DELETE FROM ai_lists WHERE user_id = ?', (user_id,))
+            self.conn.commit()
+            return False
+
+    def clear_ai_list(self, list_type):
+        with self.lock:
+            self.conn.execute('DELETE FROM ai_lists WHERE list_type = ?', (list_type,))
+            self.conn.commit()
+
+    def get_ai_list(self, list_type):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT user_id FROM ai_lists WHERE list_type = ?', (list_type,))
+            return [r[0] for r in cur.fetchall()]
+
+    def is_ai_blocked(self, user_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT 1 FROM ai_lists WHERE user_id = ? AND list_type = ?',
+                        (user_id, 'black'))
+            return cur.fetchone() is not None
+
+    # ── AI: режим подсказок (prompt) ──
+
+    def set_ai_prompt_mode(self, user_id, on):
+        with self.lock:
+            self.conn.execute(
+                'INSERT INTO ai_flags (user_id, prompt_mode) VALUES (?, ?) '
+                'ON CONFLICT(user_id) DO UPDATE SET prompt_mode = excluded.prompt_mode',
+                (user_id, 1 if on else 0)
+            )
+            self.conn.commit()
+
+    def get_ai_prompt_mode(self, user_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT prompt_mode FROM ai_flags WHERE user_id = ?', (user_id,))
+            row = cur.fetchone()
+            return bool(row and row[0])
+
+    # ── AI: квест ──
+
+    def set_ai_quest(self, user_id, state_json):
+        with self.lock:
+            self.conn.execute(
+                'INSERT INTO ai_quest (user_id, state) VALUES (?, ?) '
+                'ON CONFLICT(user_id) DO UPDATE SET state = excluded.state',
+                (user_id, state_json)
+            )
+            self.conn.commit()
+
+    def get_ai_quest(self, user_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT state FROM ai_quest WHERE user_id = ?', (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def clear_ai_quest(self, user_id):
+        with self.lock:
+            self.conn.execute('DELETE FROM ai_quest WHERE user_id = ?', (user_id,))
+            self.conn.commit()
+
+    # ── AI: задержка автоответчика ──
+
+    def get_ai_delay(self):
+        try:
+            return int(self.get_state('ai_delay', '0'))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_ai_delay(self, seconds):
+        self.set_state('ai_delay', str(max(0, seconds)))

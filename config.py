@@ -24,5 +24,17 @@ OWNER_ID = int(OWNER_ID_RAW)
 PROXY = os.environ.get('PROXY')
 PROXY_LIST = [p.strip() for p in os.environ.get('PROXY_LIST', '').split(',') if p.strip()]
 
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-1.5-flash')
+GEMINI_FALLBACK_MODELS = (
+    [m.strip() for m in os.environ.get('GEMINI_FALLBACK_MODELS', '').split(',') if m.strip()]
+    or ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+)
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'deepseek/deepseek-chat:free')
+AI_TEMPERATURE = float(os.environ.get('AI_TEMPERATURE', '0.9'))
+AI_TTS_VOICE = os.environ.get('AI_TTS_VOICE', 'ru-RU-SvetlanaNeural')
+AI_MAX_HISTORY = int(os.environ.get('AI_MAX_HISTORY', '200'))
+
 MAX_COOLDOWN_ENTRIES = 500
 MAX_FILE_SIZE_MB = 1500

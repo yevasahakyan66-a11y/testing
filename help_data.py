@@ -108,6 +108,26 @@ CMD_DESCS = {
     'protect':      {'desc': 'Защита от удаления чатов', 'syntax': '!protect [on|off]', 'example': '!protect on'},
     'rphelp':       {'desc': 'Список RP-команд', 'syntax': '!rphelp', 'example': '!rphelp'},
     'trhelp':       {'desc': 'Список кодов языков для !translate', 'syntax': '!trhelp', 'example': '!trhelp'},
+    'summary':      {'desc': 'Выжимка переписки в 3 предложениях', 'syntax': '!summary @ник [n]', 'example': '!summary @durov 50'},
+    'vibe':         {'desc': 'Анализ настроения собеседника (ИИ)', 'syntax': '!vibe @ник', 'example': '!vibe @durov'},
+    'liar':         {'desc': 'Поиск противоречий в словах (ИИ)', 'syntax': '!liar @ник', 'example': '!liar @durov'},
+    'sync':         {'desc': 'Сохранить переписку в базу ИИ', 'syntax': '!sync @ник [n]', 'example': '!sync @durov 100'},
+    'fact':         {'desc': 'Запомнить факт о человеке', 'syntax': '!fact @ник [текст] | !fact clear @ник', 'example': '!fact @durov Ненавидит капучино'},
+    'facts':        {'desc': 'Показать сохранённые факты', 'syntax': '!facts @ник', 'example': '!facts @durov'},
+    'rewrite':      {'desc': 'Переписать текст в заданном стиле (ИИ)', 'syntax': '!rewrite [стиль]', 'example': '!rewrite токсично'},
+    'fix':          {'desc': 'Грамматика + переключение раскладки ENG/RU', 'syntax': '!fix [текст]', 'example': '!fix Ghbdtn'},
+    'factcheck':    {'desc': 'Проверка фактов и нестыковок (ИИ)', 'syntax': '!factcheck', 'example': '!factcheck'},
+    'args':         {'desc': '3 контраргумента для спора (ИИ)', 'syntax': '!args', 'example': '!args'},
+    'tr':           {'desc': 'Перевод текста в Избранное (ИИ)', 'syntax': '!tr [код языка]', 'example': '!tr en'},
+    'tts':          {'desc': 'Озвучить текст голосом (edge-tts)', 'syntax': '!tts [текст]', 'example': '!tts Привет'},
+    'circle':       {'desc': 'Гифка/видео → видео-кружочек', 'syntax': '!circle (в ответ на медиа)', 'example': '!circle'},
+    'ocr':          {'desc': 'Распознать текст с картинки (ИИ)', 'syntax': '!ocr (в ответ на картинку)', 'example': '!ocr'},
+    'auto':         {'desc': 'AI-автоответчик в ЛС', 'syntax': '!auto @ник on|off [роль]', 'example': '!auto @durov on девушка'},
+    'prompt':       {'desc': '3 варианта ответа в Избранное вместо автоответа', 'syntax': '!prompt @ник on|off', 'example': '!prompt @durov on'},
+    'blacklist':    {'desc': 'Чёрный список AI-автоответчика', 'syntax': '!blacklist [@ник]', 'example': '!blacklist @durov'},
+    'whitelist':    {'desc': 'Белый список AI-автоответчика', 'syntax': '!whitelist [@ник]', 'example': '!whitelist @durov'},
+    'quest':        {'desc': 'Текстовый RPG-квест', 'syntax': '!quest [начать|действие]', 'example': '!quest начать'},
+    'helpai':       {'desc': 'Справка по AI-помощнику', 'syntax': '!helpai [раздел]', 'example': '!helpai реакции'},
 }
 
 COMMANDS_LIST = {
@@ -150,12 +170,20 @@ COMMANDS_LIST = {
     'afk': ['!afk', '!unafk'],
     'инфо': ['!chatinfo', '!members', '!admins', '!top', '!bots'],
     'rp': ['!rphelp'],
+    'ai': [
+        '!summary', '!vibe', '!liar', '!sync', '!fact', '!facts',
+        '!rewrite', '!fix', '!factcheck', '!args', '!tr',
+        '!tts', '!circle', '!ocr',
+        '!auto', '!prompt', '!blacklist', '!whitelist',
+        '!quest', '!helpai'
+    ],
 }
 
 EMOJI_MAP = {
     'основные': '⚙️', 'стелс': '🛡️', 'профиль': '👤', 'игры': '🎮',
     'youtube': '🎬', 'утилиты': '🛠', 'сообщения': '✉️', 'заметки': '📦',
     'безопасность': '🔐', 'afk': '😴', 'инфо': '📊', 'rp': '🎭',
+    'ai': '🤖',
 }
 
 HELP_CATS = {
@@ -289,6 +317,26 @@ HELP_CATS = {
             f'• {cat.capitalize()}: {", ".join(get_category_commands(cat))}'
             for cat in get_all_categories()
         )
+    ),
+    'ai': (
+        "🤖 **AI-ПОМОЩНИК**\n\n"
+        "**Контекст и анализ:**\n"
+        "`!summary @ник [n]` — выжимка переписки\n"
+        "`!vibe @ник` — настроение собеседника\n"
+        "`!liar @ник` — противоречия\n"
+        "`!sync @ник [n]` — сохранить историю в базу\n"
+        "`!fact @ник [факт]` — запомнить факт · `!facts @ник` — список\n\n"
+        "**Редактура и проверка:**\n"
+        "`!rewrite [стиль]` · `!fix [текст]` · `!factcheck` · `!args` · `!tr [язык]`\n\n"
+        "**Медиа:**\n"
+        "`!tts [текст]` — голосовое · `!circle` — кружочек (в ответ на медиа) · `!ocr` — текст с картинки\n\n"
+        "**Автоответчик в ЛС:**\n"
+        "`!auto @ник on [роль]` / `off` — роли: девушка, враг, друг, босс, свой промпт\n"
+        "`!prompt @ник on|off` — 3 варианта ответа в Избранное\n"
+        "`!delay [сек]` — пауза ИИ · `!blacklist/!whitelist [@ник]` — доступ\n\n"
+        "**Квест:** `!quest начать` / `!quest [действие]`\n\n"
+        "**Реакции в ЛС:** 🤔 🤬 ⚡ 🤓 🤡 → разбор в Избранное\n\n"
+        "💡 Полная справка по разделам: `!helpai`"
     ),
 }
 

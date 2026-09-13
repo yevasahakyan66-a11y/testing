@@ -41,6 +41,7 @@ from rp_commands import (
     get_category_commands, get_rp_reply,
 )
 from core import db, state, owner_filter, respond, _get_translator
+import ai_commands  # noqa: F401  — регистрирует AI-хендлеры (middleware, эмодзи-триггеры, команды)
 
 set_max_file_size(MAX_FILE_SIZE_MB)
 
@@ -294,8 +295,9 @@ async def delay_cmd(e):
 
     sec = int(e.pattern_match.group(1))
     state.set_reply_delay(min(sec, 30))
+    db.set_ai_delay(min(sec, 30))
     if state.reply_delay > 0:
-        await respond(e, f"⏳ **Задержка ответа: {state.reply_delay} сек.**")
+        await respond(e, f"⏳ **Задержка ответа: {state.reply_delay} сек.** (AI автоответ — тоже)")
     else:
         await respond(e, "⏳ **Задержка ответа ВЫКЛЮЧЕНА.**")
     db.bump_stat('cmds')
@@ -1959,7 +1961,7 @@ async def private_handler(event):
             if state.autodel_enabled:
                 asyncio.create_task(shadow_delete_msg(sent, state.autodel_delay))
 
-    if state.auto_reply_enabled and now - reply_cooldown.get(uid, 0) > 10:
+    if state.auto_reply_enabled and not db.is_ai_auto_on(uid) and now - reply_cooldown.get(uid, 0) > 10:
         reply_text = db.get_reply_text(uid)
         if reply_text is None:
             reply_text = db.get_default_reply()
