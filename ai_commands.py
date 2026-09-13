@@ -233,6 +233,7 @@ async def ai_private_middleware(event):
     sender_id = event.sender_id or 0
     if peer_id <= 0:
         return
+    _poll_bump(peer_id)
     try:
         db.save_ai_msg(peer_id, sender_id, text[:1000])
     except Exception as ex:
@@ -347,8 +348,16 @@ async def ai_private_middleware(event):
 # ────────────────────────────────────────────────────────────
 # ЭМОДЗИ-ТРИГГЕРЫ (реакции в ЛС)
 # ────────────────────────────────────────────────────────────
+#
+# Сервер НЕ присылает апдейт о реакции, которую владелец ставит сам на
+# сообщение собеседника (updateMessageReactions получает автор сообщения).
+# Официальные клиенты синхронизируют свои реакции коротким опросом видимых
+# сообщений (15–30с). Поэтому основной механизм здесь — опрос
+# (_reaction_poll_cycle), а апдейты остаются быстрым дополнительным путём.
 
-_reaction_current = {}
+_active_privates = {}         # peer_id -> время последней активности (для опроса)
+_reaction_poll_started = False
+_reaction_done = set()        # (peer_id, msg_id, emoji) — уже обработанные реакции
 
 
 def _reaction_emoticons(reactions):
@@ -363,26 +372,43 @@ def _reaction_emoticons(reactions):
     return out
 
 
-def _reaction_new(peer_id, msg_id, active):
-    """Вернуть эмодзи, которых ещё не было; запомнить активный набор."""
-    key = (peer_id, msg_id)
-    prev = _reaction_current.get(key, set())
-    new_em = active - prev
-    _reaction_current[key] = active
-    if len(_reaction_current) > 500:
-        cutoff_msg = msg_id - 1000
-        for k in [k for k in list(_reaction_current) if k[1] < cutoff_msg]:
-            _reaction_current.pop(k, None)
-        if len(_reaction_current) > 500:
-            first_key = next(iter(_reaction_current))
-            _reaction_current.pop(first_key, None)
-    return new_em
+def _own_reaction_emojis(reactions):
+    """Свои реакции из MessageReactions/списка ReactionCount (по chosen_order).
+
+    Для текущего пользователя server всегда заполняет chosen_order у своей
+    реакции — это серверная истина, не зависит от апдейтов и сессии.
+    """
+    out = set()
+    results = getattr(reactions, 'results', None)
+    if isinstance(results, (list, tuple)):
+        for rc in results:
+            if getattr(rc, 'chosen_order', None) is None:
+                continue
+            em = getattr(getattr(rc, 'reaction', None), 'emoticon', None)
+            if em:
+                out.add(em)
+    return out
+
+
+def _reaction_add(peer_id, msg_id, emojis):
+    """Прогнать эмодзи через общий дедуп; вернуть только новые."""
+    new = set()
+    for em in emojis:
+        key = (peer_id, msg_id, em)
+        if key not in _reaction_done:
+            _reaction_done.add(key)
+            new.add(em)
+    if len(_reaction_done) > 4000:
+        for key in list(_reaction_done)[:3000]:
+            _reaction_done.remove(key)
+    return new
 
 
 async def _process_reaction(peer_id, msg_id, emoji, text):
+    prompt = REACTION_PROMPTS.get(emoji, REACTION_PROMPTS['🤔'])
     try:
         ans, prov = await _gen(
-            REACTION_PROMPTS[emoji].replace('{}', _truncate(text, 2000)),
+            prompt.replace('{}', _truncate(text, 2000)),
             system="Ты — опытный аналитик.",
         )
         me = await _me()
@@ -432,10 +458,10 @@ def _reaction_counts(update):
 
 
 async def reactions_plural(update):
-    """Сводное обновление реакций (user-side основное, bot-side запасное).
+    """Быстрый путь: сводное обновление реакций, если оно пришло.
 
-    Срабатываем только по своим выбранным реакциям (chosen_order не пуст),
-    поэтому реакция на чужое сообщение в ЛС гарантированно триггерит разбор.
+    Основной механизм — короткий опрос (_reaction_poll_cycle): сервер шлёт
+    updateMessageReactions только автору сообщения, а не нашим сессиям.
     """
     peer = update.peer
     if not isinstance(peer, PeerUser) or peer.user_id <= 0:
@@ -447,10 +473,9 @@ async def reactions_plural(update):
         em = getattr(getattr(rc, 'reaction', None), 'emoticon', None)
         if em:
             active.add(em)
-    new_em = _reaction_new(peer.user_id, update.msg_id, active)
-    hits = new_em & set(REACTION_PROMPTS)
-    if hits:
-        await _react_to_emojis(peer.user_id, update.msg_id, hits)
+    new_em = _reaction_add(peer.user_id, update.msg_id, active & set(REACTION_PROMPTS))
+    if new_em:
+        await _react_to_emojis(peer.user_id, update.msg_id, new_em)
 
 
 @client.on(events.Raw(types=UpdateMessageReactions))  # user-side: приходит юзерботам
@@ -472,10 +497,63 @@ async def reactions_bot_single(update):
     if isinstance(actor, PeerUser) and getattr(actor, 'user_id', None) != OWNER_ID:
         return
     active = _reaction_emoticons(getattr(update, 'new_reactions', None))
-    new_em = _reaction_new(peer.user_id, update.msg_id, active)
-    hits = new_em & set(REACTION_PROMPTS)
-    if hits:
-        await _react_to_emojis(peer.user_id, update.msg_id, hits)
+    new_em = _reaction_add(peer.user_id, update.msg_id, active & set(REACTION_PROMPTS))
+    if new_em:
+        await _react_to_emojis(peer.user_id, update.msg_id, new_em)
+
+
+def _poll_bump(peer_id):
+    """Отметить ЛС активным — оно будет опрашиваться на реакции."""
+    _active_privates[peer_id] = time.time()
+    _ensure_reaction_poll()
+
+
+def _ensure_reaction_poll():
+    global _reaction_poll_started
+    if _reaction_poll_started:
+        return
+    _reaction_poll_started = True
+    asyncio.create_task(_reaction_poll_loop())
+    logger.info("Реакции: короткий опрос активен (каждые ~25 с)")
+
+
+async def _reaction_poll_loop():
+    while True:
+        try:
+            await _reaction_poll_cycle()
+        except asyncio.CancelledError:
+            return
+        except Exception as ex:
+            logger.debug(f"reaction poll: {ex}")
+        await asyncio.sleep(25)
+
+
+async def _reaction_poll_cycle():
+    now = time.time()
+    for peer_id in list(_active_privates):
+        if now - _active_privates[peer_id] > 600:  # неактивен 10 минут — пропускаем
+            continue
+        try:
+            msgs = await client.get_messages(peer_id, limit=20)
+        except Exception as ex:
+            logger.debug(f"poll {peer_id}: {ex}")
+            continue
+        for msg in msgs or ():
+            if not msg or getattr(msg, 'out', False):
+                continue
+            text = (msg.raw_text or '').strip()
+            if not text:
+                continue
+            reactions = getattr(msg, 'reactions', None)
+            if not reactions:
+                continue
+            own = _own_reaction_emojis(reactions)
+            if not own:
+                continue
+            new_em = _reaction_add(peer_id, msg.id, own)
+            if new_em:
+                for emoji in new_em:
+                    asyncio.create_task(_process_reaction(peer_id, msg.id, emoji, text))
 
 
 # ────────────────────────────────────────────────────────────

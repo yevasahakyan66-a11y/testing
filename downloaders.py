@@ -154,7 +154,113 @@ def _find_ffmpeg():
     return None
 
 
-_FFMPEG_PATH = _find_ffmpeg()
+_FFMPEG_LOCAL_DIR = os.path.abspath(os.path.join(MEDIA_DIR, 'ffmpeg'))
+_FFMPEG_LOCAL_BIN = os.path.join(_FFMPEG_LOCAL_DIR, 'ffmpeg')
+_FFPROBE_LOCAL_BIN = os.path.join(_FFMPEG_LOCAL_DIR, 'ffprobe')
+
+def _ffmpeg_static_url():
+    """URL статической сборки ffmpeg под текущую платформу (автопредустановка)."""
+    import platform
+    sysname = (platform.system() or '').lower()
+    arch = (platform.machine() or '').lower()
+    if sysname in ('linux', ''):
+        build = 'amd64' if arch in ('x86_64', 'amd64', '') else 'arm64'
+        return (f"https://johnvansickle.com/ffmpeg/releases/"
+                f"ffmpeg-release-{build}-static.tar.xz"), 'tar.xz'
+    if sysname == 'darwin':
+        return ("https://evermeet.cx/ffmpeg/get/mac64/zip"), 'zip'
+    if sysname in ('windows', 'win32'):
+        return ("https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+                "ffmpeg-master-latest-win64-gpl.zip"), 'zip'
+    return None, None
+
+def _download_static_ffmpeg():
+    """Предустановка ffmpeg: качаем статический бинарник в MEDIA_DIR/ffmpeg, если система пуста."""
+    if os.path.exists(_FFMPEG_LOCAL_BIN):
+        return _FFMPEG_LOCAL_BIN
+    url, kind = _ffmpeg_static_url()
+    if not url:
+        return None
+    tmp = os.path.join(MEDIA_DIR, f'_ffmpeg_dl.{kind}')
+    try:
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+        logger.info(f"ffmpeg не найден в системе — предустановка: {url}")
+        # через yt-dlp? нет, urllib достаточно (Railway has outbound)
+        subprocess.run(
+            [_PY_EXE, "-m", "pip", "install", "--quiet", "--upgrade", "static-ffmpeg"],
+            capture_output=True, timeout=120,
+        )
+    except Exception as ex:
+        logger.warning(f"pip static-ffmpeg failed: {ex}")
+    try:
+        import static_ffmpeg
+        paths = static_ffmpeg.add_paths()  # распакует бинарник в env
+        if paths:
+            bin_ = paths[0]  # dir с ffmpeg/ffprobe
+            first = os.path.join(bin_, 'ffmpeg')
+            if not os.path.exists(first):
+                first = os.path.join(bin_, 'ffmpeg.exe')
+            if os.path.exists(first):
+                os.makedirs(_FFMPEG_LOCAL_DIR, exist_ok=True)
+                shutil.copy2(first, _FFMPEG_LOCAL_BIN)
+                p = os.path.join(bin_, 'ffprobe')
+                if os.path.exists(p):
+                    shutil.copy2(p, _FFMPEG_LOCAL_BIN.replace('ffmpeg', 'ffprobe') if False else _FFPROBE_LOCAL_BIN)
+                logger.info(f"ffmpeg предустановлен: {_FFMPEG_LOCAL_BIN}")
+                return _FFMPEG_LOCAL_BIN
+    except Exception as ex:
+        logger.warning(f"static-ffmpeg extraction failed: {ex}")
+    # фоллбэк — ручная загрузка архивов
+    try:
+        if kind == 'tar.xz':
+            import tarfile
+            subprocess.run([_PY_EXE, "-m", "pip", "install", "--quiet", "lzma", "xz"] , capture_output=True, timeout=60) if False else None
+            # urllib может не знать xz; пробуем через curl/zstd уже в yt-dlp — но проще pip-уже сделано выше
+            return _extract_tar_xz(url, tmp)
+        elif kind == 'zip':
+            import zipfile
+            urllib.request.urlretrieve(url, tmp)
+            return _extract_zip(tmp)
+    except Exception as ex:
+        logger.warning(f"ffmpeg manual download failed: {ex}")
+    return None
+
+def _extract_tar_xz(url, tmp):
+    subprocess.run([_PY_EXE, "-m", "pip", "install", "--quiet", "py7zr"], capture_output=True, timeout=60)
+    import urllib.request
+    urllib.request.urlretrieve(url, tmp)
+    import tarfile
+    with tarfile.open(tmp, 'r') as tf:
+        os.makedirs(_FFMPEG_LOCAL_DIR, exist_ok=True)
+        tf.extractall(_FFMPEG_LOCAL_DIR, filter='data')
+    for root, _, files in os.walk(_FFMPEG_LOCAL_DIR):
+        if 'ffmpeg' in files and 'ffprobe' in files:
+            b = os.path.join(root, 'ffmpeg')
+            os.chmod(b, 0o755)
+            shutil.move(b, _FFMPEG_LOCAL_BIN)
+            shutil.move(os.path.join(root, 'ffprobe'), _FFPROBE_LOCAL_BIN)
+            return _FFMPEG_LOCAL_BIN
+    return None
+
+def _extract_zip(tmp):
+    import zipfile
+    with zipfile.ZipFile(tmp) as zf:
+        os.makedirs(_FFMPEG_LOCAL_DIR, exist_ok=True)
+        zf.extractall(_FFMPEG_LOCAL_DIR)
+    for root, _, files in os.walk(_FFMPEG_LOCAL_DIR):
+        if 'ffmpeg.exe' in files:
+            shutil.move(os.path.join(root, 'ffmpeg.exe'), _FFMPEG_LOCAL_BIN)
+        pattern = 'ffprobe.exe'
+        if pattern in files:
+            shutil.move(os.path.join(root, pattern), _FFPROBE_LOCAL_BIN)
+    if os.path.exists(_FFMPEG_LOCAL_BIN):
+        return _FFMPEG_LOCAL_BIN
+    return None
+
+if not _find_ffmpeg():
+    _downloaded = _download_static_ffmpeg()
+    _FFMPEG_LOCAL_BIN = _downloaded or _FFMPEG_LOCAL_BIN
+_FFMPEG_PATH = _find_ffmpeg() or (os.path.exists(_FFMPEG_LOCAL_BIN) and _FFMPEG_LOCAL_BIN) or None
 _HAS_FFMPEG = bool(_FFMPEG_PATH)
 if _HAS_FFMPEG:
     try:
