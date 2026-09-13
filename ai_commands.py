@@ -8,7 +8,7 @@ import time
 
 from telethon import events
 from telethon.tl.types import (
-    UpdateBotMessageReaction, UpdateBotMessageReactions,
+    UpdateMessageReactions, UpdateBotMessageReaction, UpdateBotMessageReactions,
     ReactionEmpty, User, PeerUser,
 )
 
@@ -17,7 +17,7 @@ from config import (
     logger, MEDIA_DIR, AI_TTS_VOICE, AI_MAX_HISTORY, OWNER_ID,
 )
 from core import state, db, owner_filter, respond
-from downloaders import _HAS_FFMPEG
+from downloaders import _HAS_FFMPEG, _FFMPEG_PATH
 from ai_engine import AIEngine, AIError
 
 eng = AIEngine()
@@ -87,6 +87,15 @@ def _truncate(t, n=3000):
     return t if len(t) <= n else t[:n] + "…"
 
 
+def _build_transcript(hist, me_id, trunc=150):
+    """Собрать переписку в строки «Я: …» / «Он(а): …» (без await в генераторах)."""
+    lines = []
+    for m in hist:
+        who = "Я" if m['sender_id'] == me_id else "Он(а)"
+        lines.append(f"{who}: {_truncate(m['text'], trunc)}")
+    return "\n".join(lines)
+
+
 async def _resolve_target(event, mention=None):
     """Вернуть entity собеседника: по @упоминанию → реплаю → если команда в ЛС — сам чат."""
     if mention:
@@ -114,6 +123,27 @@ async def _last_text(event):
         if hist:
             return (hist[0]['sender_id'], hist[0]['text'])
     return (None, None)
+
+
+async def _grab_history(uid, n):
+    """Вернуть до n сообщений из базы; при нехватке дотянуть прямо из Telegram."""
+    hist = db.get_ai_msgs(uid, limit=n)
+    if len(hist) >= n:
+        return hist
+    pulled = []
+    try:
+        async for m in client.iter_messages(uid, limit=n):
+            if m.raw_text and not m.raw_text.startswith('!'):
+                ts = m.date.timestamp() if m.date else time.time()
+                db.save_ai_msg(uid, m.sender_id or uid, m.raw_text[:1000], ts=ts)
+                pulled.insert(0, {'sender_id': m.sender_id or uid, 'text': m.raw_text[:1000]})
+    except Exception as ex:
+        logger.debug(f"grab_history: {ex}")
+    if len(hist) < n and pulled:
+        hist = db.get_ai_msgs(uid, limit=n)
+        if not hist:
+            hist = pulled
+    return hist
 
 
 def _target_name(ent):
@@ -373,43 +403,75 @@ async def _process_reaction(peer_id, msg_id, emoji, text):
 async def _react_to_emojis(peer_id, msg_id, emojis):
     if not emojis:
         return
-    msg = await client.get_messages(peer_id, ids=[msg_id])
-    if not msg or msg.out:
-        return
-    if not (msg.raw_text or '').strip():
+    try:
+        msg = await client.get_messages(peer_id, ids=[msg_id])
+        if not msg or msg.out:
+            return
+        text = (msg.raw_text or '').strip()
+        if not text:
+            return
+    except Exception as ex:
+        logger.debug(f"reaction fetch: {ex}")
         return
     for emoji in emojis:
-        asyncio.create_task(_process_reaction(peer_id, msg_id, emoji, msg.raw_text))
+        asyncio.create_task(_process_reaction(peer_id, msg_id, emoji, text))
 
 
-@client.on(events.Raw(types=UpdateBotMessageReaction))  # отдельное обновление: твоя реакция в ЛС
-async def bot_reaction_single(update):
-    # Фильтр: только личка и только твои реакции
+def _reaction_counts(update):
+    """Достать список ReactionCount из обновлений разного вида.
+
+    UpdateMessageReactions.user-side отдаёт объект MessageReactions (обёртку),
+    UpdateBotMessageReactions.bot-side — сразу список ReactionCount.
+    """
+    raw = getattr(update, 'reactions', None)
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raw = (getattr(raw, 'results', None) or getattr(raw, 'reactions', None)) or []
+    return list(raw)
+
+
+async def reactions_plural(update):
+    """Сводное обновление реакций (user-side основное, bot-side запасное).
+
+    Срабатываем только по своим выбранным реакциям (chosen_order не пуст),
+    поэтому реакция на чужое сообщение в ЛС гарантированно триггерит разбор.
+    """
     peer = update.peer
     if not isinstance(peer, PeerUser) or peer.user_id <= 0:
         return
-    actor = update.actor
-    if isinstance(actor, PeerUser) and actor.user_id != OWNER_ID:
-        return
-    active = _reaction_emoticons(getattr(update, 'new_reactions', None))
+    active = set()
+    for rc in _reaction_counts(update):
+        if getattr(rc, 'chosen_order', None) is None:
+            continue
+        em = getattr(getattr(rc, 'reaction', None), 'emoticon', None)
+        if em:
+            active.add(em)
     new_em = _reaction_new(peer.user_id, update.msg_id, active)
     hits = new_em & set(REACTION_PROMPTS)
     if hits:
         await _react_to_emojis(peer.user_id, update.msg_id, hits)
 
 
-@client.on(events.Raw(types=UpdateBotMessageReactions))  # сводное обновление: твои выбранные реакции
-async def bot_reaction_plural(update):
+@client.on(events.Raw(types=UpdateMessageReactions))  # user-side: приходит юзерботам
+async def reactions_user_plural(update):
+    await reactions_plural(update)
+
+
+@client.on(events.Raw(types=UpdateBotMessageReactions))  # запасной вариант для ботов
+async def reactions_bot_plural(update):
+    await reactions_plural(update)
+
+
+@client.on(events.Raw(types=UpdateBotMessageReaction))  # отдельное обновление (для ботов)
+async def reactions_bot_single(update):
     peer = update.peer
     if not isinstance(peer, PeerUser) or peer.user_id <= 0:
         return
-    active = set()
-    for rc in getattr(update, 'reactions', None) or ():
-        if getattr(rc, 'chosen_order', None) is None:
-            continue
-        em = getattr(getattr(rc, 'reaction', None), 'emoticon', None)
-        if em:
-            active.add(em)
+    actor = getattr(update, 'actor', None)
+    if isinstance(actor, PeerUser) and getattr(actor, 'user_id', None) != OWNER_ID:
+        return
+    active = _reaction_emoticons(getattr(update, 'new_reactions', None))
     new_em = _reaction_new(peer.user_id, update.msg_id, active)
     hits = new_em & set(REACTION_PROMPTS)
     if hits:
@@ -433,7 +495,7 @@ async def summary_cmd(e):
         await respond(e, f"❌ Мало сообщений в базе ({len(hist)}). Используй `!sync @{tgt.username or tgt.id} {n}`.")
         db.bump_stat('cmds')
         return
-    transcript = "\n".join(f"{'Я: ' if m['sender_id'] == (await _me()).id else 'Он(а): '}{_truncate(m['text'], 200)}" for m in hist)
+    transcript = _build_transcript(hist, (await _me()).id, 200)
     msg = await respond(e, f"⏳ Выжимаю суть из {len(hist)} сообщений...")
     try:
         res, prov = await _gen(
@@ -454,12 +516,12 @@ async def vibe_cmd(e):
     if not tgt:
         await respond(e, "ℹ️ `!vibe @ник` — анализ настроения. Работает в ЛС с этим человеком.")
         return
-    hist = db.get_ai_msgs(tgt.id, limit=100)
+    hist = await _grab_history(tgt.id, 100)
     if len(hist) < 3:
-        await respond(e, f"❌ Мало сообщений ({len(hist)}). Сначала `!sync @{tgt.username or tgt.id} 100`.")
+        await respond(e, f"❌ Мало сообщений ({len(hist)}). Работает в ЛС с этим человеком — сначала напишите друг другу.")
         db.bump_stat('cmds')
         return
-    transcript = "\n".join(f"{'Я: ' if m['sender_id'] == (await _me()).id else 'Он(а): '}{_truncate(m['text'], 150)}" for m in hist[-50:])
+    transcript = _build_transcript(hist[-50:], (await _me()).id, 150)
     msg = await respond(e, "⏳ Считываю настроение...")
     try:
         res, prov = await _gen(
@@ -468,7 +530,10 @@ async def vibe_cmd(e):
             f"🧠 Общий тон: …\n💡 Совет: …\n\nПереписка:\n{transcript}",
             system="Ты — аналитик эмоций.",
         )
-        await msg.edit(f"🎭 **Вибрация:** [{_target_name(tgt)}]\n\n{res}")
+        body = f"🎭 **Вибрация:** [{_target_name(tgt)}]\n\n{res}"
+        await msg.edit(body)
+        await _send_saved(body)
+        logger.info(f"🌀 vibe {tgt.id} ({prov})")
     except AIError as ex:
         await msg.edit(_fmt_aierr(ex))
     db.bump_stat('cmds')
@@ -481,12 +546,12 @@ async def liar_cmd(e):
     if not tgt:
         await respond(e, "ℹ️ `!liar @ник` — поиск противоречий. Работает в ЛС с этим человеком.")
         return
-    hist = db.get_ai_msgs(tgt.id, limit=AI_MAX_HISTORY)
+    hist = await _grab_history(tgt.id, AI_MAX_HISTORY)
     if len(hist) < 2:
-        await respond(e, f"❌ Мало сообщений ({len(hist)}). Сначала `!sync @{tgt.username or tgt.id}`.")
+        await respond(e, f"❌ Мало сообщений ({len(hist)}). Работает в ЛС с этим человеком — сначала напишите друг другу.")
         db.bump_stat('cmds')
         return
-    transcript = "\n".join(f"{'Я: ' if m['sender_id'] == (await _me()).id else 'Он(а): '}{_truncate(m['text'], 150)}" for m in hist)
+    transcript = _build_transcript(hist[-100:], (await _me()).id, 150)
     facts = db.get_ai_facts(tgt.id)
     extra = "\nФакты о человеке:\n- " + "\n- ".join(facts) if facts else ""
     msg = await respond(e, "⏳ Ищу противоречия...")
@@ -496,7 +561,10 @@ async def liar_cmd(e):
 где расходится с фактами. По каждому пункту дай цитируемую пару. Если противоречий нет — так и скажи.\n\n{transcript}{extra}",
             system="Ты — дотошный детектор противоречий.",
         )
-        await msg.edit(f"🕵️ **Противоречия [{_target_name(tgt)}]:**\n\n{res}")
+        body = f"🕵️ **Противоречия [{_target_name(tgt)}]:**\n\n{res}"
+        await msg.edit(body)
+        await _send_saved(body)
+        logger.info(f"🕵️ liar {tgt.id} ({prov})")
     except AIError as ex:
         await msg.edit(_fmt_aierr(ex))
     db.bump_stat('cmds')
@@ -741,15 +809,16 @@ async def tts_cmd(e):
             await msg.edit("❌ Не удалось синтезировать голос.")
             return
         if _HAS_FFMPEG:
+            ffmpeg = _FFMPEG_PATH or 'ffmpeg'
             r = await asyncio.to_thread(
                 subprocess.run,
-                ['ffmpeg', '-y', '-i', tmp, '-c:a', 'libopus', '-b:a', '48k', '-ar', '48000', ogg],
+                [ffmpeg, '-y', '-i', tmp, '-c:a', 'libopus', '-b:a', '48k', '-ar', '48000', ogg],
                 capture_output=True, timeout=120,
             )
             path = ogg if r.returncode == 0 else tmp
         else:
             path = tmp
-        await client.send_file(e.chat_id, path, voice_note=True, reply_to=msg.id)
+        await client.send_file(e.chat_id, path, voice_note=(_HAS_FFMPEG and path == ogg), reply_to=msg.id)
         await msg.delete()
         logger.info(f"🎙 TTS → {e.chat_id}")
     except ImportError:
@@ -790,13 +859,32 @@ async def circle_cmd(e):
         if not down:
             await msg.edit("❌ Не удалось скачать медиа.")
             return
-        cmd = ['ffmpeg', '-y', '-i', down,
-               '-vf', "crop='min(iw,ih)':min(iw,ih),scale=512:512,setsar=1",
-               '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
-               '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', out]
-        r_ = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, timeout=180)
-        if r_.returncode != 0 or not os.path.exists(out):
-            await msg.edit(f"❌ Конвертация не удалась: {r_.stderr[-200:]}")
+        ffmpeg = _FFMPEG_PATH or 'ffmpeg'
+        base = [ffmpeg, '-y', '-i', down,
+                '-vf', "crop='min(iw,ih)':min(iw,ih),scale=512:512,setsar=1",
+                '-pix_fmt', 'yuv420p', '-an']
+        last_err = ''
+        ok = False
+        enc_opts_map = {
+            'libx264': ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28'],
+            'libopenh264': ['-c:v', 'libopenh264', '-b:v', '900k'],
+            'mpeg4': ['-c:v', 'mpeg4', '-q:v', '5'],
+        }
+        for enc, enc_opts in enc_opts_map.items():
+            r_ = await asyncio.to_thread(
+                subprocess.run, base + enc_opts + ['-movflags', '+faststart', out],
+                capture_output=True, timeout=180,
+            )
+            if r_.returncode == 0 and os.path.exists(out):
+                ok = True
+                break
+            last_err = (r_.stderr or b'').decode('utf-8', errors='replace')[-300:]
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        if not ok:
+            await msg.edit(f"❌ Конвертация не удалась: {last_err}")
             return
         await client.send_file(e.chat_id, out, video_note=True, reply_to=msg.id)
         await msg.delete()

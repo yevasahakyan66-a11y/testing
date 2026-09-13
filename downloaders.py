@@ -132,6 +132,41 @@ if not _JS_RUNTIMES:
     logger.warning("JS runtime не найден (node/deno) — установи для лучшей совместимости с YouTube")
     logger.warning("  apt install nodejs  или  curl -fsSL https://deno.land/install.sh | sh")
 
+def _find_ffmpeg():
+    """Найти ffmpeg по имени или абсолютным путям (Railway/nix-лого может не быть в PATH)."""
+    try:
+        import shutil
+        p = shutil.which('ffmpeg')
+        if p:
+            return p
+    except Exception:
+        pass
+    for cand in (
+        '/usr/bin/ffmpeg', '/bin/ffmpeg', '/sbin/ffmpeg',
+        '/usr/local/bin/ffmpeg', '/opt/ffmpeg/bin/ffmpeg',
+        '/opt/homebrew/bin/ffmpeg',
+    ):
+        if os.path.exists(cand):
+            return cand
+    candidates = sorted(glob.glob('/nix/store/*/bin/ffmpeg'), key=os.path.getmtime, reverse=True)
+    if candidates:
+        return candidates[0]
+    return None
+
+
+_FFMPEG_PATH = _find_ffmpeg()
+_HAS_FFMPEG = bool(_FFMPEG_PATH)
+if _HAS_FFMPEG:
+    try:
+        subprocess.run([_FFMPEG_PATH, '-version'], capture_output=True, check=True, timeout=10)
+    except Exception:
+        _FFMPEG_PATH = None
+        _HAS_FFMPEG = False
+if _HAS_FFMPEG:
+    logger.info(f"ffmpeg: {_FFMPEG_PATH}")
+else:
+    logger.info("ffmpeg не найден — конвертация видео/аудио недоступна")
+
 _YT_DL_OPTS = {
     'outtmpl': os.path.join(MEDIA_DIR, '%(id)s.%(ext)s'),
     'quiet': True,
@@ -151,13 +186,8 @@ _YT_DL_OPTS = {
         'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
     },
 }
-
-_HAS_FFMPEG = False
-try:
-    subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-    _HAS_FFMPEG = True
-except Exception:
-    pass
+if _FFMPEG_PATH:
+    _YT_DL_OPTS['ffmpeg_location'] = os.path.dirname(_FFMPEG_PATH)
 
 _AUTH_WALL_HINTS = (
     re.compile(r'sign\s?in\s?to\s?confirm', re.I),
@@ -615,6 +645,8 @@ _GEN_OPTS = {
         'Accept-Language': 'en-US,en;q=0.9',
     },
 }
+if _FFMPEG_PATH:
+    _GEN_OPTS['ffmpeg_location'] = os.path.dirname(_FFMPEG_PATH)
 
 
 def _is_direct_media(url):
