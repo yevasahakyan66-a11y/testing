@@ -153,8 +153,29 @@ def _target_name(ent):
 
 
 def _system_for_auto(user_auto, uid):
-    base = ROLE_PROMPTS.get(user_auto['role']) or user_auto['prompt'] or ROLE_PROMPTS['друг']
-    lines = [base]
+    desc = (user_auto.get('prompt') or user_auto.get('role') or 'друг').strip()
+    lines = [
+        "Ты — автоответчик владельца юзербота. Отвечаешь ОТ ЕГО ИМЕНИ в личном чате, как сам владелец.",
+        f"Собеседник, с которым ведёт переписку владелец: {desc}. "
+        "Это описание того, КТО пишет владельцу (пол, характер, положение), а НЕ твоя роль. "
+        "Обращайся к собеседнику корректно и не называй его «парнем»/«девушкой» без причины.",
+    ]
+    src_peer = uid
+    src_n = 50
+    _src = (db.get_state('ai_style_src', '') or '').strip()
+    _n = (db.get_state('ai_style_n', '') or '').strip()
+    if _src and _src.isdigit() and int(_src) > 0:
+        src_peer = int(_src)
+        if _n and _n.isdigit():
+            src_n = int(_n)
+    style = db.get_ai_msgs(src_peer, limit=src_n, sender=OWNER_ID)
+    if style:
+        examples = [_truncate(m['text'], 220) for m in style if m.get('text')][-22:]
+        if src_peer == uid:
+            lines.append("Так пишет владелец в этой переписке (копируй его манеру, тон, длину сообщений, смайлы и орфографию):")
+        else:
+            lines.append(f"Так пишет владелец в чате #{src_peer} ({src_n} последних сообщений) — копируй его манеру, тон, длину сообщений, смайлы и орфографию:")
+        lines.append("\n".join("- " + ex for ex in examples))
     facts = db.get_ai_facts(uid)
     if facts:
         lines.append("Факты о собеседнике, которые обязательно учитывать:\n- " + "\n- ".join(facts))
@@ -552,7 +573,7 @@ async def _reaction_poll_cycle():
             own = _own_reaction_emojis(reactions)
             if not own:
                 continue
-            new_em = _reaction_add(peer_id, msg.id, own)
+            new_em = _reaction_add(peer_id, msg.id, own & set(REACTION_PROMPTS))
             if new_em:
                 for emoji in new_em:
                     asyncio.create_task(_process_reaction(peer_id, msg.id, emoji, text))
@@ -612,7 +633,6 @@ async def vibe_cmd(e):
         )
         body = f"🎭 **Вибрация:** [{_target_name(tgt)}]\n\n{res}"
         await msg.edit(body)
-        await _send_saved(body)
         logger.info(f"🌀 vibe {tgt.id} ({prov})")
     except AIError as ex:
         await msg.edit(_fmt_aierr(ex))
@@ -643,7 +663,6 @@ async def liar_cmd(e):
         )
         body = f"🕵️ **Противоречия [{_target_name(tgt)}]:**\n\n{res}"
         await msg.edit(body)
-        await _send_saved(body)
         logger.info(f"🕵️ liar {tgt.id} ({prov})")
     except AIError as ex:
         await msg.edit(_fmt_aierr(ex))
@@ -812,8 +831,7 @@ async def tr_cmd(e):
             f"Переведи на язык с кодом {lang}. Только перевод, без пояснений:\n\n{_truncate(text, 2500)}",
             system="Ты — профессиональный переводчик.",
         )
-        await msg.edit("✅ Переведено → в Избранное.")
-        await _send_saved(res, caption=f"🌐 Перевод ({lang})")
+        await msg.edit(f"🌐 **Перевод ({lang}):**\n\n{res}")
     except AIError as ex:
         await msg.edit(_fmt_aierr(ex))
     db.bump_stat('cmds')
@@ -996,12 +1014,28 @@ async def auto_cmd(e):
         await respond(e, f"🔕 Автоответчик для [{_target_name(tgt)}](tg://user?id={tgt.id}) **ВЫКЛЮЧЕН**.")
     else:
         role = (role or 'друг').strip()
-        if role in ROLE_PROMPTS:
-            db.set_ai_auto(tgt.id, True, role=role)
-            await respond(e, f"🤖 Автоответчик для [{_target_name(tgt)}](tg://user?id={tgt.id}) ВКЛЮЧЁН.\n🎭 Роль: **{role}**.")
-        else:
-            db.set_ai_auto(tgt.id, True, role='кастомная', prompt=role)
-            await respond(e, f"🤖 Автоответчик для [{_target_name(tgt)}](tg://user?id={tgt.id}) ВКЛЮЧЁН.\n📝 Кастомный промпт: _{role}_")
+        db.set_ai_auto(tgt.id, True, role='', prompt=role)
+        await respond(e, f"🤖 Автоответчик для [{_target_name(tgt)}](tg://user?id={tgt.id}) ВКЛЮЧЁН.\n👤 Собеседник: **{role}** (копирую твой стиль из этого чата).")
+    db.bump_stat('cmds')
+
+
+@client.on(events.NewMessage(pattern=r'!style\s+(@\w+)\s+on(?:\s+(\d+))?$', func=owner_filter))
+async def style_src_cmd(e):
+    mention, n = e.pattern_match.group(1), e.pattern_match.group(2)
+    src = await client.get_entity(mention)
+    n = max(5, min(int(n or 60), 400))
+    db.set_state('ai_style_src', str(src.id))
+    db.set_state('ai_style_n', str(n))
+    await respond(e, f"🎨 Стиль владельца теперь берётся из [{_target_name(src)}](tg://user?id={src.id}), "
+                     f"последние **{n}** сообщений владельца. Автоответчики будут копировать эту манеру.")
+    db.bump_stat('cmds')
+
+
+@client.on(events.NewMessage(pattern=r'!style\s+off$', func=owner_filter))
+async def style_src_off_cmd(e):
+    db.set_state('ai_style_src', '')
+    db.set_state('ai_style_n', '')
+    await respond(e, "🎨 Стиль-источник сброшен: автоответчики снова берут манеру владельца из текущего чата автоматически.")
     db.bump_stat('cmds')
 
 
