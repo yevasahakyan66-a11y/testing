@@ -10,6 +10,7 @@ _VALID_TABLES = frozenset({
     'bot_state', 'saved_data', 'notes', 'todos', 'stats',
     'reply_settings', 'sessions', 'protected_chats',
     'ai_msgs', 'ai_facts', 'ai_auto', 'ai_lists', 'ai_flags', 'ai_quest',
+    'msg_cache',
 })
 
 
@@ -82,6 +83,18 @@ class Storage:
                     user_id INTEGER PRIMARY KEY,
                     state TEXT
                 );
+                CREATE TABLE IF NOT EXISTS msg_cache (
+                    chat_id INTEGER,
+                    msg_id INTEGER,
+                    sender_id INTEGER,
+                    sender_name TEXT,
+                    date INTEGER,
+                    kind TEXT,
+                    text TEXT,
+                    file_path TEXT,
+                    PRIMARY KEY (chat_id, msg_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_msg_cache_date ON msg_cache (date);
             ''')
             self.conn.commit()
 
@@ -180,8 +193,11 @@ class Storage:
     # ── Todos ──
 
     def add_todo(self, text):
-        tid = int(time.time())
         with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT COALESCE(MAX(id), 0) FROM todos')
+            last_id = cur.fetchone()[0] or 0
+            tid = max(int(time.time()), int(last_id) + 1)
             self.conn.execute(
                 'INSERT INTO todos (id, text, done, created) VALUES (?, ?, 0, ?)',
                 (tid, text, tid)
@@ -450,3 +466,75 @@ class Storage:
 
     def set_ai_delay(self, seconds):
         self.set_state('ai_delay', str(max(0, seconds)))
+
+    # ── Кэш сообщений (анти-удаление) ──
+
+    def cache_msg(self, chat_id, msg_id, sender_id, sender_name, kind, text, file_path=None, ts=None):
+        ts = ts or int(time.time())
+        with self.lock:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO msg_cache '
+                '(chat_id, msg_id, sender_id, sender_name, date, kind, text, file_path) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (chat_id, msg_id, sender_id, sender_name, ts, kind, text, file_path)
+            )
+            self.conn.commit()
+
+    def get_cached_msg(self, chat_id, msg_id):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                'SELECT chat_id, msg_id, sender_id, sender_name, date, kind, text, file_path '
+                'FROM msg_cache WHERE chat_id = ? AND msg_id = ?',
+                (chat_id, msg_id)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_cached_by_msgid(self, msg_id):
+        """Анти-удаление: в ЛС событие удаления не содержит чат, только id.
+        Берём самую свежую запись по id."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                'SELECT chat_id, msg_id, sender_id, sender_name, date, kind, text, file_path '
+                'FROM msg_cache WHERE msg_id = ? ORDER BY date DESC LIMIT 1',
+                (msg_id,)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def update_cached_text(self, chat_id, msg_id, text):
+        with self.lock:
+            self.conn.execute(
+                'UPDATE msg_cache SET text = ? WHERE chat_id = ? AND msg_id = ?',
+                (text, chat_id, msg_id)
+            )
+            self.conn.commit()
+
+    def del_cached_msg(self, chat_id, msg_id):
+        with self.lock:
+            self.conn.execute(
+                'DELETE FROM msg_cache WHERE chat_id = ? AND msg_id = ?',
+                (chat_id, msg_id)
+            )
+            self.conn.commit()
+
+    def purge_cache(self, cutoff):
+        """Удалить записи старше cutoff (unix time). Вернуть список file_path."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT file_path FROM msg_cache WHERE date < ?', (cutoff,))
+            paths = [r[0] for r in cur.fetchall() if r[0]]
+            self.conn.execute('DELETE FROM msg_cache WHERE date < ?', (cutoff,))
+            self.conn.commit()
+        return paths
+
+    def cache_stats(self):
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute('SELECT COUNT(*) FROM msg_cache')
+            total = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM msg_cache WHERE file_path IS NOT NULL AND file_path != ''")
+            media = cur.fetchone()[0]
+        return {'total': total, 'media': media}

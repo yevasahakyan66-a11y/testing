@@ -132,18 +132,23 @@ def safe_eval(expr: str):
         return None
 
 
+_RU_UPPER = 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
+_RU_LOWER = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
+
+
 def caesar(text, shift, dec=False):
     if dec:
         shift = -shift
     out = []
     for c in text:
-        if 'А' <= c <= 'я' or c in 'ёЁ':
-            base = ord('А' if c.isupper() or c == 'Ё' else 'а')
-            size = 33
-            out.append(chr((ord(c) - base + shift) % size + base))
-        elif c.isalpha():
-            base = ord('A' if c.isupper() else 'a')
-            out.append(chr((ord(c) - base + shift) % 26 + base))
+        if c in _RU_UPPER:
+            out.append(_RU_UPPER[(_RU_UPPER.index(c) + shift) % len(_RU_UPPER)])
+        elif c in _RU_LOWER:
+            out.append(_RU_LOWER[(_RU_LOWER.index(c) + shift) % len(_RU_LOWER)])
+        elif 'A' <= c <= 'Z':
+            out.append(chr((ord(c) - ord('A') + shift) % 26 + ord('A')))
+        elif 'a' <= c <= 'z':
+            out.append(chr((ord(c) - ord('a') + shift) % 26 + ord('a')))
         else:
             out.append(c)
     return ''.join(out)

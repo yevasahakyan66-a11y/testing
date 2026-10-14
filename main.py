@@ -1,3 +1,14 @@
+# ВАЖНО: выставить путь к CA-бандлу certifi ДО импорта aiohttp,
+# иначе aiohttp запоминает системные сертификаты на момент импорта и
+# HTTPS-запросы падают с CERTIFICATE_VERIFY_FAILED на машинах со
+# устаревшим системным хранилищем.
+import os as _os
+try:
+    import certifi as _certifi
+    _os.environ.setdefault('SSL_CERT_FILE', _certifi.where())
+except Exception:
+    pass
+
 import asyncio
 import base64
 import datetime
@@ -16,7 +27,7 @@ from flask import Flask
 from PIL import Image, ImageDraw
 
 from telethon import events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import FloodWaitError
 from client import client
 from telethon.tl.functions.account import (
     GetAuthorizationsRequest,
@@ -40,15 +51,15 @@ from rp_commands import (
     RP_COMMANDS, format_rp_action, get_all_categories,
     get_category_commands, get_rp_reply,
 )
-from core import db, state, owner_filter, respond, _get_translator
+from core import db, state, owner_filter, owner_only_filter, respond, _get_translator
 import ai_commands  # noqa: F401  — регистрирует AI-хендлеры (middleware, эмодзи-триггеры, команды)
+import antidel  # noqa: F401  — анти-удаление сообщений в ЛС (всегда включено)
 
 set_max_file_size(MAX_FILE_SIZE_MB)
 
 _log = logger
 command_cooldown = defaultdict(float)
 reply_cooldown = {}
-_download_lock = asyncio.Lock()
 _watch_task = None
 _protect_task = None
 
@@ -185,7 +196,7 @@ async def info_cmd(e):
     )
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!restart$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!restart$', func=owner_only_filter))
 async def restart_cmd(e):
 
     await respond(e, '🔄 Перезагрузка...')
@@ -314,7 +325,7 @@ async def readreceipt_cmd(e):
         await respond(e, "👁️ **Прочтение ВКЛЮЧЕНО** — сообщения отмечаются прочитанными.")
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!sudo(?:\s+(on|off)\s+(\S+))?\s*$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!sudo(?:\s+(on|off)\s+(\S+))?\s*$', func=owner_only_filter))
 async def sudo_cmd(e):
 
     g = e.pattern_match
@@ -354,7 +365,8 @@ async def sudo_cmd(e):
 @client.on(events.NewMessage(pattern=r'!status_reset$', func=owner_filter))
 async def status_reset_cmd(e):
     state.reset_stealth()
-    await respond(e, "🔄 **Все стелс-режимы сброшены**: cover, silent, shadow, lock, mute — выключены.")
+    await respond(e, "🔄 **Все стелс-режимы сброшены:** cover, silent, shadow, lock, mute, "
+                     "typing, autodel, readreceipt выключены, задержка ответа = 0.")
     db.bump_stat('cmds')
 
 @client.on(events.NewMessage(pattern=r'!me$', func=owner_filter))
@@ -390,7 +402,7 @@ async def avatar_cmd(e):
         await respond(e, "❌ Аватарка не найдена")
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!name (.+)', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!name (.+)', func=owner_only_filter))
 async def name_cmd(e):
 
     n = e.pattern_match.group(1).strip()
@@ -398,7 +410,7 @@ async def name_cmd(e):
     await respond(e, f"✅ Имя → **{n}**")
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!lastname(?:\s+(.+))?$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!lastname(?:\s+(.+))?$', func=owner_only_filter))
 async def lastname_cmd(e):
 
     n = (e.pattern_match.group(1) or '').strip()
@@ -406,7 +418,7 @@ async def lastname_cmd(e):
     await respond(e, f"✅ Фамилия → **{n}**" if n else "✅ Фамилия удалена")
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!bio(?:\s+(.+))?$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!bio(?:\s+(.+))?$', func=owner_only_filter))
 async def bio_cmd(e):
 
     t = (e.pattern_match.group(1) or '').strip()
@@ -700,35 +712,70 @@ async def remind_cmd(e):
     asyncio.create_task(send_reminder(e.chat_id, text, delay))
     db.bump_stat('cmds')
 
+HTTP_UA = 'TelegramUserBot/1.0 (+https://github.com/anomalyco/opencode)'
+
+
+async def _wiki_search(query, lang='en'):
+    """Поиск в Wikipedia через MediaWiki API. Возвращает список результатов."""
+    import html as _html
+    params = {
+        'action': 'query',
+        'list': 'search',
+        'srsearch': query,
+        'format': 'json',
+        'srlimit': 5,
+        'utf8': 1,
+    }
+    async with aiohttp.ClientSession(headers={'User-Agent': HTTP_UA}) as s:
+        async with s.get(
+            f'https://{lang}.wikipedia.org/w/api.php',
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"Wikipedia ({lang}) HTTP {resp.status}")
+                return []
+            data = await resp.json(content_type=None)
+    out = []
+    for r in data.get('query', {}).get('search', []):
+        title = r.get('title', '?')
+        snippet = re.sub(r'<[^>]+>', '', r.get('snippet', ''))
+        snippet = _html.unescape(snippet).replace('\n', ' ').strip()
+        out.append({
+            'title': title,
+            'href': f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}",
+            'snippet': snippet[:160],
+        })
+    return out
+
+
 @client.on(events.NewMessage(pattern=r'!search (.+)', func=owner_filter))
 async def search_cmd(e):
-    query = _to_english(e.pattern_match.group(1).strip())
+    query = e.pattern_match.group(1).strip()
     msg = await respond(e, "⏳ Ищу...")
     try:
-        params = {
-            'action': 'query',
-            'list': 'search',
-            'srsearch': query,
-            'format': 'json',
-            'srlimit': 5,
-        }
-        async with aiohttp.ClientSession() as s:
-            async with s.get('https://en.wikipedia.org/w/api.php', params=params) as resp:
-                data = await resp.json()
-        results = data.get('query', {}).get('search', [])
+        try:
+            query_en = await asyncio.to_thread(_to_english, query)
+        except Exception as ex:
+            logger.warning(f"search translate failed: {ex}")
+            query_en = query
+        results = await _wiki_search(query_en, 'en')
+        if not results and query_en != query:
+            results = await _wiki_search(query, 'ru')
         if not results:
-            await msg.edit("❌ Ничего не найдено.")
+            results = await _wiki_search(query, 'en')
+        if not results:
+            await msg.edit(f"❌ Ничего не найдено по запросу _{query}_.")
+            db.bump_stat('cmds')
             return
         lines = [f"🔍 **Результаты (Wikipedia):** _{query}_\n"]
         for i, r in enumerate(results, 1):
-            title = r.get('title', '?')
-            href = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
-            snippet = r.get('snippet', '').replace('<span class="searchmatch">', '**').replace('</span>', '**')[:120]
-            lines.append(f"{i}. [{title}]({href})")
-            if snippet:
-                lines.append(f"   _{snippet}_")
+            lines.append(f"{i}. [{r['title']}]({r['href']})")
+            if r['snippet']:
+                lines.append(f"   _{r['snippet']}_")
         await msg.edit("\n".join(lines))
     except Exception as ex:
+        logger.warning(f"search error: {ex}")
         await msg.edit(f"❌ Ошибка поиска: {ex}")
     db.bump_stat('cmds')
 
@@ -757,9 +804,9 @@ async def weather_cmd(e):
     city = e.pattern_match.group(1).strip()
     msg = await respond(e, "⏳ Запрашиваю погоду...")
     try:
-        city_en = _to_english(city)
+        city_en = await asyncio.to_thread(_to_english, city)
         from urllib.parse import quote
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers={'User-Agent': HTTP_UA}) as s:
             async with s.get(f"https://wttr.in/{quote(city_en)}?format=j1",
                              timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status != 200:
@@ -788,7 +835,7 @@ async def weather_cmd(e):
         )
     except (aiohttp.ClientError, ConnectionError) as ex:
         logger.warning(f"wttr.in failed: {ex}, trying Open-Meteo...")
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers={'User-Agent': HTTP_UA}) as s:
             geo_r = await s.get(
                 f"https://geocoding-api.open-meteo.com/v1/search?name={quote(city_en)}&count=1",
                 timeout=aiohttp.ClientTimeout(total=10)
@@ -1488,7 +1535,7 @@ async def bots_cmd(e):
         await respond(e, f"❌ {ex}")
     db.bump_stat('cmds')
 
-@client.on(events.NewMessage(pattern=r'!resetdata$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!resetdata$', func=owner_only_filter))
 async def resetdata_cmd(e):
 
     db.clear_all()
@@ -1670,6 +1717,7 @@ async def sub_cmd(e):
     msg = await respond(e, f"⏳ Ищу субтитры ({lang})...")
     try:
         def _get_captions():
+            import yt_dlp
             out_dir = os.path.join(MEDIA_DIR, 'subtmp')
             os.makedirs(out_dir, exist_ok=True)
             opts = {
@@ -1737,7 +1785,7 @@ async def sub_cmd(e):
     db.bump_stat('cmds')
 
 
-@client.on(events.NewMessage(pattern=r'!watch\s+(on|off)$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!watch\s+(on|off)$', func=owner_only_filter))
 async def watch_cmd(e):
     global _watch_task
     arg = e.pattern_match.group(1)
@@ -1820,7 +1868,7 @@ async def check_email_cmd(e):
     db.bump_stat('cmds')
 
 
-@client.on(events.NewMessage(pattern=r'!protect\s+(on|off)$', func=owner_filter))
+@client.on(events.NewMessage(pattern=r'!protect\s+(on|off)$', func=owner_only_filter))
 async def protect_cmd(e):
     global _protect_task
     arg = e.pattern_match.group(1)

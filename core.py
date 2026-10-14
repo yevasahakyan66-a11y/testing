@@ -1,6 +1,4 @@
-import asyncio
 import time
-from collections import defaultdict
 
 from config import OWNER_ID, MAX_FILE_SIZE_MB, logger
 from downloaders import set_max_file_size
@@ -158,16 +156,11 @@ class BotState:
         self.autodel_enabled = False
         self.autodel_delay = 10
         self.reply_delay = 0
-        self.readreceipt_enabled = True
+        self.readreceipt_enabled = False
         self._save()
 
 
 state = BotState()
-command_cooldown = defaultdict(float)
-reply_cooldown = {}
-_download_lock = None
-_watch_task = None
-_protect_task = None
 
 
 def owner_filter(event):
@@ -176,6 +169,15 @@ def owner_filter(event):
         if not text.startswith('!cover') and not text.startswith('!status_reset'):
             return False
     return event.sender_id == OWNER_ID or event.sender_id in state.sudo_users
+
+
+def owner_only_filter(event):
+    """Как owner_filter, но только для владельца (sudo не допускаются)."""
+    if state.cover_enabled:
+        text = event.raw_text or ''
+        if not text.startswith('!cover') and not text.startswith('!status_reset'):
+            return False
+    return event.sender_id == OWNER_ID
 
 
 async def respond(event, text, **kwargs):

@@ -3,6 +3,7 @@ import base64
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -93,7 +94,14 @@ else:
     logger.info("cookies.txt не найден — скачивание YouTube может не работать без авторизации")
     logger.info("Задай YOUTUBE_COOKIES в .env или создай cookies.txt из cookies.txt.example")
 
+def _autoupdate_enabled():
+    return os.environ.get('YTDLP_AUTOUPDATE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def _update_ytdlp():
+    if not _autoupdate_enabled():
+        logger.info("yt-dlp auto-update пропущен (включить: YTDLP_AUTOUPDATE=1)")
+        return
     try:
         old_ver = getattr(yt_dlp.version, '__version__', '???')
         subprocess.run(
@@ -207,7 +215,7 @@ def _download_static_ffmpeg():
                 shutil.copy2(first, _FFMPEG_LOCAL_BIN)
                 p = os.path.join(bin_, 'ffprobe')
                 if os.path.exists(p):
-                    shutil.copy2(p, _FFMPEG_LOCAL_BIN.replace('ffmpeg', 'ffprobe') if False else _FFPROBE_LOCAL_BIN)
+                    shutil.copy2(p, _FFPROBE_LOCAL_BIN)
                 logger.info(f"ffmpeg предустановлен: {_FFMPEG_LOCAL_BIN}")
                 return _FFMPEG_LOCAL_BIN
     except Exception as ex:
@@ -215,12 +223,8 @@ def _download_static_ffmpeg():
     # фоллбэк — ручная загрузка архивов
     try:
         if kind == 'tar.xz':
-            import tarfile
-            subprocess.run([_PY_EXE, "-m", "pip", "install", "--quiet", "lzma", "xz"] , capture_output=True, timeout=60) if False else None
-            # urllib может не знать xz; пробуем через curl/zstd уже в yt-dlp — но проще pip-уже сделано выше
             return _extract_tar_xz(url, tmp)
         elif kind == 'zip':
-            import zipfile
             urllib.request.urlretrieve(url, tmp)
             return _extract_zip(tmp)
     except Exception as ex:
@@ -228,8 +232,6 @@ def _download_static_ffmpeg():
     return None
 
 def _extract_tar_xz(url, tmp):
-    subprocess.run([_PY_EXE, "-m", "pip", "install", "--quiet", "py7zr"], capture_output=True, timeout=60)
-    import urllib.request
     urllib.request.urlretrieve(url, tmp)
     import tarfile
     with tarfile.open(tmp, 'r') as tf:
@@ -249,17 +251,23 @@ def _extract_zip(tmp):
     with zipfile.ZipFile(tmp) as zf:
         os.makedirs(_FFMPEG_LOCAL_DIR, exist_ok=True)
         zf.extractall(_FFMPEG_LOCAL_DIR)
+    found_ff = found_fp = None
     for root, _, files in os.walk(_FFMPEG_LOCAL_DIR):
-        if 'ffmpeg.exe' in files:
-            shutil.move(os.path.join(root, 'ffmpeg.exe'), _FFMPEG_LOCAL_BIN)
-        pattern = 'ffprobe.exe'
-        if pattern in files:
-            shutil.move(os.path.join(root, pattern), _FFPROBE_LOCAL_BIN)
+        for name in files:
+            full = os.path.join(root, name)
+            if name in ('ffmpeg', 'ffmpeg.exe') and not found_ff:
+                found_ff = full
+            elif name in ('ffprobe', 'ffprobe.exe') and not found_fp:
+                found_fp = full
+    if found_ff:
+        shutil.move(found_ff, _FFMPEG_LOCAL_BIN)
+    if found_fp:
+        shutil.move(found_fp, _FFPROBE_LOCAL_BIN)
     if os.path.exists(_FFMPEG_LOCAL_BIN):
         return _FFMPEG_LOCAL_BIN
     return None
 
-if not _find_ffmpeg():
+if not _find_ffmpeg() and _autoupdate_enabled():
     _downloaded = _download_static_ffmpeg()
     _FFMPEG_LOCAL_BIN = _downloaded or _FFMPEG_LOCAL_BIN
 _FFMPEG_PATH = _find_ffmpeg() or (os.path.exists(_FFMPEG_LOCAL_BIN) and _FFMPEG_LOCAL_BIN) or None
